@@ -1,0 +1,19 @@
+{
+  "name": "binance-websocket-listener",
+  "version": "1.0.0",
+  "description": "Binance WebSocket listener for crypto trading system",
+  "main": "scripts/binance-websocket-listener.js",
+  "scripts": {
+    "start": "node scripts/binance-websocket-listener.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "node-fetch": "^2.7.0",
+    "dotenv": "^17.2.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Brandon",
+  "license": "MIT"
+}
