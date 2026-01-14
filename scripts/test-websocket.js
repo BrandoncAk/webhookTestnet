@@ -1,7 +1,7 @@
 const WebSocket = require("ws");
 
 const LISTEN_KEY =
-  "gtG2sXKwDHkMiZ3GRqSEZoEal8LEhSnAxHUE0uCXTEpynQGlC5jpSo5ZGsFf";
+  "Qq22nOGeT0KmISVRPDnNzRKtIYFRwxMFQPLpcTN13PPs0zp49JGqDb33bzkG";
 const ws = new WebSocket(`wss://stream.binance.com/ws/${LISTEN_KEY}`);
 
 ws.on("open", () => {
