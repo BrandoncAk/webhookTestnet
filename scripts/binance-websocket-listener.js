@@ -131,6 +131,9 @@ async function checkOrdersViaAPI() {
     const queryString = `timestamp=${timestamp}`;
     const signature = generateSignature(queryString);
 
+    let url = `${CURRENT_CONFIG.REST_URL}/api/v3/openOrders?symbol=BTCUSDT&${queryString}&signature=${signature}`;
+
+    console.log("Main URL", url);
     // Obtener todas las órdenes abiertas
     const response = await fetchWithTimeout(
       `${CURRENT_CONFIG.REST_URL}/api/v3/openOrders?symbol=BTCUSDT&${queryString}&signature=${signature}`,
