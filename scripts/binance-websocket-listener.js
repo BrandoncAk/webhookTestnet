@@ -1,71 +1,40 @@
 // ========================================
-// Binance WebSocket Listener V4
-// Optimizado para Render.com con FETCH
+// Binance WebSocket Listener V5
+// Con soporte para Polling en Testnet
 // ========================================
 
 require("dotenv").config();
 
 const WebSocket = require("ws");
 const http = require("http");
+const crypto = require("crypto");
 
 // ========================================
 // CONFIGURACIÓN
 // ========================================
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
-const IS_TESTNET = process.env.IS_TESTNET;
+const IS_TESTNET = process.env.IS_TESTNET === "true";
+const BINANCE_API_KEY = process.env.BINANCE_API_KEY;
+const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET;
 
 // URLs según ambiente
-const BINANCE_REST_URL = IS_TESTNET
-  ? "https://testnet.binance.vision"
-  : "https://api.binance.com";
-const BINANCE_WS_BASE = IS_TESTNET
-  ? "wss://testnet.binance.vision/ws"
-  : "wss://stream.binance.com:9443/ws";
+const CONFIG = {
+  testnet: {
+    REST_URL: "https://testnet.binance.vision",
+    WS_URL: null, // No soportado en Testnet Spot
+    USE_POLLING: true,
+    POLLING_INTERVAL: 15000, // 15 segundos
+  },
+  mainnet: {
+    REST_URL: "https://api.binance.com",
+    WS_URL: "wss://stream.binance.com:9443/ws",
+    USE_POLLING: false,
+    POLLING_INTERVAL: null,
+  },
+};
 
-// ========================================
-// CLASE ABORTCONTROLLER PARA TIMEOUTS
-// ========================================
-
-class TimeoutController {
-  constructor(timeoutMs) {
-    this.controller = new AbortController();
-    this.timeoutId = setTimeout(() => this.controller.abort(), timeoutMs);
-  }
-
-  get signal() {
-    return this.controller.signal;
-  }
-
-  clear() {
-    clearTimeout(this.timeoutId);
-  }
-}
-
-// ========================================
-// FUNCIÓN FETCH CON TIMEOUT
-// ========================================
-
-async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
-  const timeoutController = new TimeoutController(timeoutMs);
-
-  try {
-    const response = await fetch(url, {
-      ...options,
-      signal: timeoutController.signal,
-    });
-
-    timeoutController.clear();
-    return response;
-  } catch (error) {
-    timeoutController.clear();
-
-    if (error.name === "AbortError") {
-      throw new Error(`Timeout después de ${timeoutMs}ms`);
-    }
-    throw error;
-  }
-}
+const CURRENT_CONFIG = IS_TESTNET ? CONFIG.testnet : CONFIG.mainnet;
 
 // ========================================
 // VARIABLES GLOBALES
@@ -75,27 +44,49 @@ let listenKey = null;
 let ws = null;
 let pingInterval = null;
 let renewInterval = null;
+let pollingInterval = null;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 15; // Más intentos para Render
+let lastKnownOrders = new Map(); // Para tracking de cambios
+const MAX_RECONNECT_ATTEMPTS = 10;
 
 // ========================================
-// 1. OBTENER LISTENKEY CON FETCH
+// UTILIDADES
+// ========================================
+
+function generateSignature(queryString) {
+  return crypto
+    .createHmac("sha256", BINANCE_API_SECRET)
+    .update(queryString)
+    .digest("hex");
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error.name === "AbortError") {
+      throw new Error(`Timeout después de ${timeoutMs}ms`);
+    }
+    throw error;
+  }
+}
+
+// ========================================
+// 1. OBTENER LISTENKEY
 // ========================================
 
 async function getListenKey() {
   try {
     console.log("🔄 Obteniendo ListenKey de Binance...");
-
-    // const response = await fetchWithTimeout(
-    //   "https://slay-seven.vercel.app/api/webhooks/binance/userDataStream",
-    //   {
-    //     method: "POST",
-    //     headers: {
-    //       "Content-Type": "application/json",
-    //     },
-    //   },
-    //   10000,
-    // );
 
     const response = await fetch(
       "https://slay-seven.vercel.app/api/webhooks/binance/userDataStream",
@@ -106,14 +97,13 @@ async function getListenKey() {
     );
 
     const data = await response.json();
-    console.log("RESPONSE ALV", data);
+    console.log("📡 Respuesta ListenKey:", {
+      success: data.success,
+      hasKey: !!data.listenKey,
+    });
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    if (!data.listenKey) {
-      throw new Error("No se recibió listenKey en la respuesta");
+    if (!response.ok || !data.listenKey) {
+      throw new Error(data.error || "No se recibió listenKey");
     }
 
     console.log(`✅ ListenKey obtenida: ${data.listenKey.substring(0, 20)}...`);
@@ -125,62 +115,183 @@ async function getListenKey() {
 }
 
 // ========================================
-// 2. CONECTAR WEBSOCKET
+// 2. POLLING PARA TESTNET
+// ========================================
+
+async function checkOrdersViaAPI() {
+  try {
+    const timestamp = Date.now();
+    const queryString = `timestamp=${timestamp}`;
+    const signature = generateSignature(queryString);
+
+    // Obtener todas las órdenes abiertas
+    const response = await fetchWithTimeout(
+      `${CURRENT_CONFIG.REST_URL}/api/v3/openOrders?${queryString}&signature=${signature}`,
+      {
+        headers: { "X-MBX-APIKEY": BINANCE_API_KEY },
+      },
+      10000,
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(`API Error: ${errorData.msg || response.status}`);
+    }
+
+    const openOrders = await response.json();
+
+    // También verificar órdenes recientes (últimas 24h) para detectar FILLED
+    const allOrdersResponse = await fetchWithTimeout(
+      `${CURRENT_CONFIG.REST_URL}/api/v3/allOrders?symbol=BTCUSDT&limit=20&timestamp=${Date.now()}&signature=${generateSignature(`symbol=BTCUSDT&limit=20&timestamp=${Date.now()}`)}`,
+      {
+        headers: { "X-MBX-APIKEY": BINANCE_API_KEY },
+      },
+      10000,
+    );
+
+    const allOrders = await allOrdersResponse.json();
+
+    // Procesar cambios
+    await processOrderChanges(allOrders);
+
+    return openOrders;
+  } catch (error) {
+    console.error("❌ Error en polling:", error.message);
+    return [];
+  }
+}
+
+async function processOrderChanges(orders) {
+  for (const order of orders) {
+    const orderId = order.orderId.toString();
+    const previousStatus = lastKnownOrders.get(orderId);
+
+    // Si es una orden nueva o cambió de estado
+    if (!previousStatus || previousStatus !== order.status) {
+      console.log(
+        `\n📊 Orden ${orderId}: ${previousStatus || "NEW"} → ${order.status}`,
+      );
+
+      // Si pasó a FILLED o CANCELED, enviar al webhook
+      if (order.status === "FILLED" || order.status === "CANCELED") {
+        const event = convertOrderToEvent(order);
+        await sendToWebhook(event);
+      }
+
+      // Actualizar tracking
+      lastKnownOrders.set(orderId, order.status);
+    }
+  }
+
+  // Limpiar órdenes antiguas del tracking (más de 100 órdenes)
+  if (lastKnownOrders.size > 100) {
+    const entries = [...lastKnownOrders.entries()];
+    entries.slice(0, entries.length - 50).forEach(([key]) => {
+      lastKnownOrders.delete(key);
+    });
+  }
+}
+
+function convertOrderToEvent(order) {
+  // Convertir formato de API REST a formato de WebSocket event
+  return {
+    e: "executionReport",
+    E: Date.now(),
+    s: order.symbol,
+    c: order.clientOrderId,
+    S: order.side,
+    o: order.type,
+    f: order.timeInForce,
+    q: order.origQty,
+    p: order.price,
+    P: "0.00000000",
+    F: "0.00000000",
+    g: -1,
+    C: "",
+    x: order.status === "FILLED" ? "TRADE" : order.status,
+    X: order.status,
+    r: "NONE",
+    i: order.orderId,
+    l: order.executedQty,
+    z: order.executedQty,
+    L: order.price,
+    n: "0",
+    N: null,
+    T: order.updateTime,
+    t: -1,
+    I: order.orderId,
+    w: false,
+    m: false,
+    M: false,
+    O: order.time,
+    Z: order.cummulativeQuoteQty,
+    Y: order.cummulativeQuoteQty,
+    Q: "0.00000000",
+    // Campo personalizado para identificar que viene de polling
+    _source: "polling",
+  };
+}
+
+function startPolling() {
+  console.log(
+    `\n🔄 Iniciando polling cada ${CURRENT_CONFIG.POLLING_INTERVAL / 1000} segundos...`,
+  );
+  console.log("   (Testnet no soporta WebSocket User Data Stream)");
+
+  // Polling inicial
+  checkOrdersViaAPI();
+
+  // Polling periódico
+  pollingInterval = setInterval(async () => {
+    console.log("🔍 Verificando órdenes...");
+    await checkOrdersViaAPI();
+  }, CURRENT_CONFIG.POLLING_INTERVAL);
+}
+
+// ========================================
+// 3. WEBSOCKET PARA MAINNET
 // ========================================
 
 function connectWebSocket() {
+  if (!CURRENT_CONFIG.WS_URL) {
+    console.log("⚠️ WebSocket no disponible en este ambiente");
+    return;
+  }
+
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
     console.error(
-      `❌ Máximo de intentos de reconexión alcanzado (${MAX_RECONNECT_ATTEMPTS})`,
+      `❌ Máximo de intentos alcanzado (${MAX_RECONNECT_ATTEMPTS})`,
     );
-    console.error(
-      "   Render.com está funcionando, pero Binance rechaza la conexión",
-    );
-    console.error("   Posibles causas:");
-    console.error("   1. API Key inválida o expirada");
-    console.error("   2. ListenKey expirada");
-    console.error("   3. Problemas temporales de Binance");
-
-    // En Render, mejor reiniciar el servicio después de un tiempo
-    setTimeout(() => {
-      console.log("🔄 Reiniciando servicio en 30 segundos...");
-      process.exit(1); // Render reiniciará automáticamente
-    }, 30000);
-
+    setTimeout(() => process.exit(1), 30000);
     return;
   }
 
   if (!listenKey) {
-    console.error("❌ No hay ListenKey para conectar");
+    console.error("❌ No hay ListenKey");
     return;
   }
 
-  // URL CORREGIDA para Render (añadir slash)
-  const WS_URL = `${BINANCE_WS_BASE}/${listenKey}`;
+  const WS_URL = `${CURRENT_CONFIG.WS_URL}/${listenKey}`;
 
   reconnectAttempts++;
   console.log(`🔌 Conectando WebSocket (Intento ${reconnectAttempts})...`);
   console.log("   URL:", WS_URL);
 
-  // Configuración especial para Render
   ws = new WebSocket(WS_URL, {
     handshakeTimeout: 10000,
     perMessageDeflate: false,
   });
 
-  // ========== EVENTOS WEBSOCKET ==========
-
   ws.on("open", () => {
-    console.log("✅ WebSocket conectado exitosamente desde Render.com");
+    console.log("✅ WebSocket conectado");
     console.log("⏰", new Date().toISOString());
     reconnectAttempts = 0;
 
-    // Ping cada 2 minutos (más frecuente para mantener conexión)
     pingInterval = setInterval(
       () => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.ping();
-          console.log("🏓 Ping enviado para mantener conexión viva");
+          console.log("🏓 Ping enviado");
         }
       },
       2 * 60 * 1000,
@@ -192,14 +303,10 @@ function connectWebSocket() {
       const event = JSON.parse(data.toString());
 
       if (event.e === "executionReport") {
-        await handleExecutionReport(event);
-      } else if (
-        event.e === "outboundAccountPosition" ||
-        event.e === "balanceUpdate"
-      ) {
-        console.log(`💰 Evento de cuenta: ${event.e}`);
+        console.log("\n📊 Evento executionReport recibido via WebSocket");
+        await sendToWebhook(event);
       } else {
-        console.log(`📨 Evento ${event.e || "desconocido"} recibido`);
+        console.log(`📨 Evento: ${event.e || "desconocido"}`);
       }
     } catch (error) {
       console.error("❌ Error procesando mensaje:", error.message);
@@ -208,126 +315,90 @@ function connectWebSocket() {
 
   ws.on("error", (error) => {
     console.error("❌ Error WebSocket:", error.message);
-    if (error.code) {
-      console.error("   Código:", error.code);
-    }
   });
 
   ws.on("close", (code, reason) => {
-    console.log(`🔌 WebSocket cerrado: ${code} - ${reason || "Sin razón"}`);
-    console.log("⏰", new Date().toISOString());
-
+    console.log(`🔌 WebSocket cerrado: ${code}`);
     clearInterval(pingInterval);
 
-    // Backoff exponencial con límite
-    const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts), 45000); // Max 45s
+    const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts), 45000);
     console.log(`🔄 Reconectando en ${Math.round(delay / 1000)}s...`);
 
     setTimeout(async () => {
-      try {
-        // Para reconexiones después del primer fallo, obtener nueva listenKey
-        if (reconnectAttempts > 1) {
-          console.log("🔄 Obteniendo nueva ListenKey para reconexión...");
-          listenKey = await getListenKey();
-        }
-        connectWebSocket();
-      } catch (error) {
-        console.error("❌ Error preparando reconexión:", error.message);
+      if (reconnectAttempts > 1) {
+        listenKey = await getListenKey();
       }
+      connectWebSocket();
     }, delay);
   });
 
   ws.on("pong", () => {
-    console.log("🏓 Pong recibido - Conexión saludable");
+    console.log("🏓 Pong recibido");
   });
 }
 
 // ========================================
-// 3. MANEJAR EVENTOS Y ENVIAR A WEBHOOK
+// 4. ENVIAR A WEBHOOK
 // ========================================
 
-async function handleExecutionReport(event) {
+async function sendToWebhook(event) {
   const {
     i: orderId,
     s: symbol,
     X: status,
     x: eventType,
     z: executedQty,
+    S: side,
+    p: price,
+    L: lastPrice,
   } = event;
 
-  console.log("\n📊 Evento executionReport");
+  console.log("\n📤 Enviando a webhook:");
   console.log("   Orden:", orderId);
   console.log("   Símbolo:", symbol);
+  console.log("   Lado:", side);
   console.log("   Estado:", status);
-  console.log("   Evento:", eventType);
   console.log("   Ejecutado:", executedQty);
-  console.log("   ⏰", new Date().toISOString());
+  console.log("   Precio:", lastPrice || price);
+  console.log("   Fuente:", event._source || "websocket");
 
-  // Enviar a webhook
-  await sendToWebhookWithRetry(event, 3);
-}
-
-async function sendToWebhookWithRetry(event, maxRetries) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      console.log(`📤 Enviando a webhook (${attempt}/${maxRetries})...`);
-
       const response = await fetchWithTimeout(
         WEBHOOK_URL,
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "User-Agent": "Binance-Listener/4.0",
+            "User-Agent": "Binance-Listener/5.0",
             "X-Binance-Event": "executionReport",
+            "X-Event-Source": event._source || "websocket",
           },
           body: JSON.stringify(event),
         },
         10000,
       );
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const responseText = await response.text();
-      console.log("✅ Webhook respondió:", response.status);
-
-      if (responseText) {
-        try {
-          const data = JSON.parse(responseText);
-          console.log(
-            "   Respuesta:",
-            data.success ? "Éxito" : "Error",
-            data.message || "",
-          );
-        } catch {
-          console.log("   Respuesta:", responseText.substring(0, 100));
-        }
-      }
-
-      return; // Éxito
-    } catch (error) {
-      console.error(`   ❌ Intento ${attempt} falló:`, error.message);
-
-      if (attempt < maxRetries) {
-        const delay = 1500 * attempt; // 1.5s, 3s, 4.5s...
-        console.log(`   ⏳ Esperando ${delay / 1000}s...`);
-        await sleep(delay);
+      if (response.ok) {
+        console.log(`✅ Webhook enviado exitosamente`);
+        return true;
       } else {
-        console.error(`❌ Falló después de ${maxRetries} intentos`);
-        // En Render, podemos loguear para debugging pero continuar
+        console.error(`❌ Webhook respondió: ${response.status}`);
+      }
+    } catch (error) {
+      console.error(`❌ Intento ${attempt} falló:`, error.message);
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
       }
     }
   }
-}
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  console.error("❌ Falló después de 3 intentos");
+  return false;
 }
 
 // ========================================
-// 4. RENOVAR LISTENKEY CADA 30 MIN
+// 5. RENOVAR LISTENKEY
 // ========================================
 
 async function renewListenKey() {
@@ -337,183 +408,134 @@ async function renewListenKey() {
     console.log("🔄 Renovando ListenKey...");
 
     const response = await fetchWithTimeout(
-      "http://slay-seven.vercel.app/api/webhooks/binance/userDataStream",
+      "https://slay-seven.vercel.app/api/webhooks/binance/userDataStream",
       {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
-          "User-Agent": "Binance-Listener/Render",
         },
         body: JSON.stringify({ listenKey }),
       },
       10000,
     );
 
-    if (!response.success) {
-      if (response.status === 404) {
-        throw new Error("ListenKey no encontrada (expirada)");
-      }
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
+    const data = await response.json();
 
-    console.log("✅ ListenKey renovada");
-    console.log("   ⏰", new Date().toISOString());
+    if (data.success) {
+      console.log("✅ ListenKey renovada");
+    } else {
+      throw new Error(data.error || "Error renovando");
+    }
   } catch (error) {
-    console.error("❌ Error renovando ListenKey:", error.message);
+    console.error("❌ Error renovando:", error.message);
 
     // Si expiró, obtener nueva
-    if (
-      error.message.includes("expirada") ||
-      error.message.includes("no encontrada")
-    ) {
-      console.log("   🔄 ListenKey expirada, obteniendo nueva...");
-      try {
-        listenKey = await getListenKey();
-
-        // Reconectar con nueva key
-        if (ws) {
-          ws.close();
-          setTimeout(() => connectWebSocket(), 1000);
-        }
-      } catch (getError) {
-        console.error(
-          "   ❌ Error obteniendo nueva ListenKey:",
-          getError.message,
-        );
+    try {
+      listenKey = await getListenKey();
+      if (ws && !CURRENT_CONFIG.USE_POLLING) {
+        ws.close();
+        setTimeout(() => connectWebSocket(), 1000);
       }
+    } catch (e) {
+      console.error("❌ Error obteniendo nueva key:", e.message);
     }
   }
 }
 
-function startListenKeyRenewal() {
-  // Renovar cada 25 minutos (menos de 30 para ser seguros)
-  renewInterval = setInterval(renewListenKey, 25 * 60 * 1000);
-  console.log("⏰ Renovación automática cada 25 minutos\n");
-}
-
 // ========================================
-// 5. HEALTH CHECK PARA RENDER
+// 6. HEALTH SERVER
 // ========================================
 
 function startHealthServer() {
   const PORT = process.env.PORT || 3000;
 
   const server = http.createServer((req, res) => {
-    // Render requiere que respondamos rápido (<10s)
     if (req.url === "/health" || req.url === "/") {
-      const isConnected = ws && ws.readyState === WebSocket.OPEN;
-      const status = isConnected ? "healthy" : "unhealthy";
-      const statusCode = isConnected ? 200 : 503;
+      const isHealthy = CURRENT_CONFIG.USE_POLLING
+        ? !!pollingInterval
+        : ws && ws.readyState === WebSocket.OPEN;
 
-      // Respuesta MINIMALISTA para Render
-      const healthData = {
-        status: status,
-        service: "binance-websocket-listener",
-        version: "4.0",
-        ws_connected: isConnected,
-        listen_key_active: !!listenKey,
-        uptime_seconds: Math.floor(process.uptime()),
-        reconnect_attempts: reconnectAttempts,
-      };
-
-      res.writeHead(statusCode, {
+      res.writeHead(isHealthy ? 200 : 503, {
         "Content-Type": "application/json",
-        "Cache-Control": "no-cache",
       });
-      res.end(JSON.stringify(healthData));
+      res.end(
+        JSON.stringify({
+          status: isHealthy ? "healthy" : "unhealthy",
+          mode: CURRENT_CONFIG.USE_POLLING ? "polling" : "websocket",
+          environment: IS_TESTNET ? "testnet" : "mainnet",
+          uptime_seconds: Math.floor(process.uptime()),
+          listen_key_active: !!listenKey,
+          tracked_orders: lastKnownOrders.size,
+        }),
+      );
     } else if (req.url === "/status") {
-      // Endpoint más detallado para debugging
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify(
           {
             service: "binance-listener",
-            environment: IS_TESTNET ? "testnet" : "production",
-            node_version: process.version,
-            memory_usage: process.memoryUsage(),
-            ws_status: getWsStatus(ws),
-            listen_key_preview: listenKey
-              ? `${listenKey.substring(0, 10)}...`
-              : null,
-            webhook_url: WEBHOOK_URL ? "configured" : "missing",
+            version: "5.0",
+            mode: CURRENT_CONFIG.USE_POLLING ? "polling" : "websocket",
+            environment: IS_TESTNET ? "testnet" : "mainnet",
+            polling_interval: CURRENT_CONFIG.POLLING_INTERVAL,
+            ws_status: ws
+              ? ["CONNECTING", "OPEN", "CLOSING", "CLOSED"][ws.readyState]
+              : "N/A",
+            tracked_orders: lastKnownOrders.size,
+            memory: process.memoryUsage(),
             timestamp: new Date().toISOString(),
           },
           null,
           2,
         ),
       );
+    } else if (req.url === "/test-poll") {
+      // Endpoint para forzar un polling manual
+      checkOrdersViaAPI().then((orders) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            orders_checked: orders.length,
+            tracked: lastKnownOrders.size,
+          }),
+        );
+      });
     } else {
-      res.writeHead(404, { "Content-Type": "application/json" });
+      res.writeHead(404);
       res.end(JSON.stringify({ error: "Not Found" }));
     }
   });
 
   server.listen(PORT, () => {
-    console.log(`🏥 Health server en puerto ${PORT}`);
-    console.log(`   Health check: http://localhost:${PORT}/health`);
-    console.log(`   Status detallado: http://localhost:${PORT}/status`);
-    console.log("");
+    console.log(`\n🏥 Health server en puerto ${PORT}`);
+    console.log(`   Health: http://localhost:${PORT}/health`);
+    console.log(`   Status: http://localhost:${PORT}/status`);
+    console.log(`   Test Poll: http://localhost:${PORT}/test-poll`);
   });
 
   return server;
 }
 
-function getWsStatus(ws) {
-  if (!ws) return "not_initialized";
-  const states = ["CONNECTING", "OPEN", "CLOSING", "CLOSED"];
-  return states[ws.readyState] || "UNKNOWN";
-}
-
 // ========================================
-// 6. GRACEFUL SHUTDOWN PARA RENDER
+// 7. GRACEFUL SHUTDOWN
 // ========================================
 
 function setupGracefulShutdown(server) {
   async function shutdown(signal) {
-    console.log(`\n👋 ${signal} recibido. Cerrando servicio...`);
+    console.log(`\n👋 ${signal} recibido. Cerrando...`);
 
-    // 1. Detener intervalos
     clearInterval(pingInterval);
     clearInterval(renewInterval);
+    clearInterval(pollingInterval);
 
-    // 2. Cerrar WebSocket
-    if (ws) {
-      ws.close(1000, "Service shutdown");
-    }
+    if (ws) ws.close(1000, "Shutdown");
 
-    // 3. Intentar eliminar ListenKey de Binance (opcional)
-    if (listenKey && BINANCE_API_KEY) {
-      setTimeout(async () => {
-        try {
-          await fetchWithTimeout(
-            "http://slay-seven.vercel.app/api/webhooks/binance/userDataStream",
-            {
-              method: "DELETE",
-              headers: {
-                "Content-Type": "application/json",
-                "User-Agent": "Binance-Listener/Render",
-              },
-              body: JSON.stringify({ listenKey }),
-            },
-            5000,
-          );
-          console.log("🗑️ ListenKey eliminada de Binance");
-        } catch (error) {
-          // Ignorar en shutdown
-        }
-      }, 100);
-    }
+    server.close(() => console.log("✅ HTTP server cerrado"));
 
-    // 4. Cerrar servidor HTTP
-    server.close(() => {
-      console.log("✅ Servidor HTTP cerrado");
-    });
-
-    // 5. Dar tiempo y salir
     setTimeout(() => {
       console.log("✅ Shutdown completo");
       process.exit(0);
-    }, 2500);
+    }, 2000);
   }
 
   process.on("SIGINT", () => shutdown("SIGINT"));
@@ -521,77 +543,78 @@ function setupGracefulShutdown(server) {
 }
 
 // ========================================
-// 7. MANEJO DE ERRORES
-// ========================================
-
-function setupGlobalErrorHandling() {
-  process.on("uncaughtException", (error) => {
-    console.error("❌ UNCAUGHT EXCEPTION:", error.message);
-    console.error("Stack:", error.stack);
-    // En Render, mejor continuar a menos que sea crítico
-  });
-
-  process.on("unhandledRejection", (reason, promise) => {
-    console.error("❌ UNHANDLED REJECTION:", reason);
-    // Log pero continuar
-  });
-}
-
-// ========================================
-// 8. INICIALIZACIÓN PRINCIPAL
+// 8. INICIALIZACIÓN
 // ========================================
 
 async function initialize() {
-  console.log("🚀 Binance WebSocket Listener V4");
-  console.log("Deploy: Render.com");
-  console.log("Modo:", IS_TESTNET ? "TESTNET 🧪" : "PRODUCTION 🚀");
+  console.log("\n");
+  console.log("═══════════════════════════════════════════════════");
+  console.log("🚀 Binance Listener V5");
+  console.log("═══════════════════════════════════════════════════");
+  console.log("Ambiente:", IS_TESTNET ? "TESTNET 🧪" : "MAINNET 🚀");
+  console.log(
+    "Modo:",
+    CURRENT_CONFIG.USE_POLLING ? "POLLING 🔄" : "WEBSOCKET 🔌",
+  );
   console.log("Webhook:", WEBHOOK_URL || "NO CONFIGURADO");
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("═══════════════════════════════════════════════════\n");
 
   if (!WEBHOOK_URL) {
-    console.error("❌ ERROR: WEBHOOK_URL no configurado");
-    console.error("   Necesitas una URL para enviar los eventos");
+    console.error("❌ WEBHOOK_URL no configurado");
+    process.exit(1);
+  }
+
+  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
+    console.error("❌ API Keys no configuradas");
     process.exit(1);
   }
 
   try {
-    // 1. Obtener ListenKey inicial
+    // 1. Obtener ListenKey (útil para renovación aunque usemos polling)
     listenKey = await getListenKey();
 
-    // 2. Iniciar servidor health check (Render lo requiere rápido)
+    // 2. Iniciar health server
     const server = startHealthServer();
-
-    // 3. Configurar shutdown graceful
     setupGracefulShutdown(server);
 
-    // 4. Conectar WebSocket
-    setTimeout(() => connectWebSocket(), 500);
+    // 3. Iniciar según modo
+    if (CURRENT_CONFIG.USE_POLLING) {
+      // TESTNET: Usar polling
+      console.log("\n⚠️ Testnet Spot no soporta WebSocket User Data Stream");
+      console.log("   Usando polling como alternativa\n");
+      startPolling();
+    } else {
+      // MAINNET: Usar WebSocket
+      setTimeout(() => connectWebSocket(), 500);
+    }
 
-    // 5. Iniciar renovación de ListenKey
-    setTimeout(() => startListenKeyRenewal(), 60000); // Esperar 1 minuto
+    // 4. Renovación de ListenKey (cada 25 min)
+    renewInterval = setInterval(renewListenKey, 25 * 60 * 1000);
 
-    console.log("✅ Servicio inicializado para Render.com");
-    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    console.log("✅ Servicio inicializado\n");
   } catch (error) {
     console.error("❌ Error inicializando:", error.message);
-
-    // En Render, si falla al inicio, salir para que reinicie
-    setTimeout(() => {
-      console.log("🔄 Reiniciando en 10 segundos...");
-      process.exit(1);
-    }, 10000);
+    setTimeout(() => process.exit(1), 10000);
   }
 }
 
 // ========================================
-// INICIAR APLICACIÓN
+// ERROR HANDLING
 // ========================================
 
-// Configurar manejo de errores primero
-setupGlobalErrorHandling();
+process.on("uncaughtException", (error) => {
+  console.error("❌ UNCAUGHT:", error.message);
+});
 
-// Inicializar
+process.on("unhandledRejection", (reason) => {
+  console.error("❌ UNHANDLED:", reason);
+});
+
+// ========================================
+// START
+// ========================================
+
 initialize().catch((error) => {
-  console.error("❌ Error fatal:", error);
+  console.error("❌ Fatal:", error);
   process.exit(1);
 });
