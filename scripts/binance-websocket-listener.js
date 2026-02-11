@@ -133,7 +133,7 @@ async function checkOrdersViaAPI() {
 
     // Obtener todas las órdenes abiertas
     const response = await fetchWithTimeout(
-      `${CURRENT_CONFIG.REST_URL}/api/v3/openOrders?symbol=BTCUSDT${queryString}&signature=${signature}`,
+      `${CURRENT_CONFIG.REST_URL}/api/v3/openOrders?symbol=BTCUSDT&${queryString}&signature=${signature}`,
       {
         headers: { "X-MBX-APIKEY": BINANCE_API_KEY },
       },
