@@ -145,12 +145,8 @@ async function checkOrdersViaAPI() {
       throw new Error(`API Error: ${errorData.msg || response.status}`);
     }
 
+    console.log("📦 Respuesta de Binance openOrders:", response);
     const openOrders = await response.json();
-
-    console.log(
-      "📦 Respuesta de Binance openOrders:",
-      JSON.stringify(response).substring(0, 500),
-    );
 
     // También verificar órdenes recientes (últimas 24h) para detectar FILLED
     const allOrdersResponse = await fetchWithTimeout(
@@ -163,10 +159,7 @@ async function checkOrdersViaAPI() {
 
     const allOrders = await allOrdersResponse.json();
 
-    console.log(
-      "📦 Respuesta de Binance allOrders:",
-      JSON.stringify(allOrdersResponse).substring(0, 500),
-    );
+    console.log("📦 Respuesta de Binance allOrders:", allOrdersResponse);
 
     // Procesar cambios
     await processOrderChanges(allOrders);
