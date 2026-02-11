@@ -119,6 +119,13 @@ async function getListenKey() {
 // ========================================
 
 async function checkOrdersViaAPI() {
+  console.log("🔑 API Key presente:", !!BINANCE_API_KEY);
+  console.log(
+    "🔑 API Key (primeros 10 chars):",
+    BINANCE_API_KEY?.substring(0, 10),
+  );
+  console.log("🔑 API Secret presente:", !!BINANCE_API_SECRET);
+
   try {
     const timestamp = Date.now();
     const queryString = `timestamp=${timestamp}`;
