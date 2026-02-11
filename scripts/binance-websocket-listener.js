@@ -140,6 +140,11 @@ async function checkOrdersViaAPI() {
 
     const openOrders = await response.json();
 
+    console.log(
+      "📦 Respuesta de Binance openOrders:",
+      JSON.stringify(response).substring(0, 500),
+    );
+
     // También verificar órdenes recientes (últimas 24h) para detectar FILLED
     const allOrdersResponse = await fetchWithTimeout(
       `${CURRENT_CONFIG.REST_URL}/api/v3/allOrders?symbol=BTCUSDT&limit=20&timestamp=${Date.now()}&signature=${generateSignature(`symbol=BTCUSDT&limit=20&timestamp=${Date.now()}`)}`,
@@ -150,6 +155,11 @@ async function checkOrdersViaAPI() {
     );
 
     const allOrders = await allOrdersResponse.json();
+
+    console.log(
+      "📦 Respuesta de Binance allOrders:",
+      JSON.stringify(allOrdersResponse).substring(0, 500),
+    );
 
     // Procesar cambios
     await processOrderChanges(allOrders);
