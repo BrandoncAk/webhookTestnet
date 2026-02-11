@@ -127,13 +127,19 @@ async function checkOrdersViaAPI() {
   console.log("🔑 API Secret presente:", !!BINANCE_API_SECRET);
 
   try {
-    const timestamp = Date.now();
-    const queryString = `timestamp=${timestamp}`;
-    const signature = generateSignature(queryString);
+    const params = {
+      symbol: "BTCUSDT",
+      timestamp: Date.now(),
+    };
 
-    let url = `${CURRENT_CONFIG.REST_URL}/api/v3/openOrders?symbol=BTCUSDT&${queryString}&signature=${signature}`;
+    // 1. Generar query string
+    const queryString = new URLSearchParams(params).toString(); // "symbol=BTCUSDT&timestamp=..."
 
-    console.log("Main URL", url);
+    // 2. ¡CODIFICAR antes de firmar! (percent-encoding)
+    const encodedQueryString = encodeURIComponent(queryString);
+
+    const signature = generateSignature(encodedQueryString);
+
     // Obtener todas las órdenes abiertas
     const response = await fetchWithTimeout(
       `${CURRENT_CONFIG.REST_URL}/api/v3/openOrders?symbol=BTCUSDT&${queryString}&signature=${signature}`,
