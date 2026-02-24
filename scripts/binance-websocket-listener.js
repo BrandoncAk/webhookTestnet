@@ -189,7 +189,7 @@ function connectWebSocket() {
       );
       return;
     }
-
+    console.log("Mensaje: ", msg);
     // Respuesta al session.logon
     if (msg.id === "session-login") {
       if (msg.status === 200) {
