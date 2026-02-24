@@ -4,7 +4,9 @@
   "description": "Binance WebSocket listener for crypto trading system",
   "main": "scripts/binance-websocket-listener.js",
   "scripts": {
-    "start": "node scripts/binance-websocket-listener.js"
+    "start": "node scripts/binance-websocket-listener.js",
+    "pre-deploy": "node pre-deploy.js",
+    "pre-deploy:verbose": "node pre-deploy.js --verbose"
   },
   "dependencies": {
     "ws": "^8.16.0",
