@@ -1,9 +1,13 @@
-// ========================================
-// Binance WebSocket Listener V6
-// Migrado al nuevo sistema de autenticación
-// Sin listenKey — WebSocket API autenticada directamente
-// Compatible con Testnet y Mainnet
-// ========================================
+// ============================================================
+// Binance WebSocket Listener V7
+// Autenticación Ed25519 — WebSocket API sin listenKey
+//
+// Cambios desde V6:
+//   - Firma Ed25519 para session.logon (requerida por Binance WS API)
+//   - HMAC-SHA256 se mantiene solo para REST API (polling fallback)
+//   - Variable BINANCE_PRIVATE_KEY en lugar de BINANCE_API_SECRET para WS
+//   - Validación de BINANCE_PRIVATE_KEY al iniciar
+// ============================================================
 
 require("dotenv").config();
 
@@ -11,86 +15,84 @@ const WebSocket = require("ws");
 const http = require("http");
 const crypto = require("crypto");
 
-// ========================================
+// ============================================================
 // CONFIGURACIÓN
-// ========================================
+// ============================================================
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const IS_TESTNET = process.env.IS_TESTNET === "true";
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY;
-const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET;
+const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET; // Para REST/HMAC (polling)
+const BINANCE_PRIVATE_KEY_RAW = process.env.BINANCE_PRIVATE_KEY; // Para WS/Ed25519
 
-// URLs según ambiente
-// NOTA: Desde 2026-02-04 el sistema de listenKey fue eliminado.
-// Ahora se usa autenticación directa en el WebSocket API.
-// Docs: https://developers.binance.com/docs/binance-spot-api-docs/websocket-api
 const CONFIG = {
   testnet: {
     REST_URL: "https://testnet.binance.vision",
     WS_API_URL: "wss://ws-api.testnet.binance.vision/ws-api/v3",
-    WS_STREAM_URL: "wss://stream.testnet.binance.vision:9443/ws",
   },
   mainnet: {
     REST_URL: "https://api.binance.com",
     WS_API_URL: "wss://ws-api.binance.com:443/ws-api/v3",
-    WS_STREAM_URL: "wss://stream.binance.com:9443/ws",
   },
 };
 
 const CURRENT_CONFIG = IS_TESTNET ? CONFIG.testnet : CONFIG.mainnet;
 
-// ========================================
+// ============================================================
 // VARIABLES GLOBALES
-// ========================================
+// ============================================================
 
 let ws = null;
 let pingInterval = null;
+let pollingInterval = null;
 let reconnectAttempts = 0;
 let isAuthenticated = false;
 let isSubscribed = false;
 let lastKnownOrders = new Map();
+let privateKey = null; // Objeto CryptoKey cargado al iniciar
 
 const MAX_RECONNECT_ATTEMPTS = 10;
 const PING_INTERVAL_MS = 2 * 60 * 1000; // 2 minutos
-// El servidor envía ping cada 20s y desconecta si no recibe pong en 1 minuto.
-// Nuestro ping proactivo cada 2 min mantiene la conexión activa entre esos pings del servidor.
 
-// ========================================
-// UTILIDADES DE FIRMA
-// ========================================
+// ============================================================
+// FIRMA Ed25519 — para WebSocket API (session.logon)
+// ============================================================
 
 /**
- * Genera firma HMAC-SHA256.
- * IMPORTANTE: El payload debe estar construido con valores percent-encoded
- * antes de llamar a esta función (cambio efectivo 2026-01-15 en Testnet).
+ * Carga la llave privada Ed25519 desde la variable de entorno.
+ * BINANCE_PRIVATE_KEY puede tener \n literales (formato Railway/Render)
+ * o saltos de línea reales. Ambos se normalizan aquí.
  */
-function generateSignature(payload) {
-  return crypto
-    .createHmac("sha256", BINANCE_API_SECRET)
-    .update(payload)
-    .digest("hex");
+function loadPrivateKey() {
+  if (!BINANCE_PRIVATE_KEY_RAW) {
+    throw new Error(
+      "BINANCE_PRIVATE_KEY no está definida en las variables de entorno",
+    );
+  }
+
+  // Normalizar: reemplazar \n literales por saltos de línea reales
+  const pem = BINANCE_PRIVATE_KEY_RAW.replace(/\\n/g, "\n");
+
+  // Verificar que tiene la estructura PEM correcta
+  if (!pem.includes("-----BEGIN PRIVATE KEY-----")) {
+    throw new Error(
+      "BINANCE_PRIVATE_KEY no tiene formato PEM válido. " +
+        "Debe comenzar con -----BEGIN PRIVATE KEY-----",
+    );
+  }
+
+  try {
+    return crypto.createPrivateKey({ key: pem, format: "pem" });
+  } catch (err) {
+    throw new Error(`Error cargando llave privada Ed25519: ${err.message}`);
+  }
 }
 
 /**
- * Construye un query string con percent-encoding correcto para Binance.
- * Cada clave y valor se encodea individualmente antes de firmar.
- * @param {Object} params - Parámetros a encodear
- * @returns {{ queryString: string, signature: string }}
- */
-function buildSignedQuery(params) {
-  const queryString = Object.entries(params)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-    .join("&");
-
-  const signature = generateSignature(queryString);
-  return { queryString, signature };
-}
-
-/**
- * Construye el payload de firma para el WebSocket API.
+ * Genera firma Ed25519 para el WebSocket API.
  * Los params se ordenan alfabéticamente antes de firmar.
- * @param {Object} params
- * @returns {{ params: Object, signature: string }}
+ * @param {Object} params — parámetros del request (sin signature)
+ * @returns {{ params: Object }} — params originales + signature en base64
  */
 function buildWsSignedParams(params) {
   const sortedPayload = Object.keys(params)
@@ -98,34 +100,55 @@ function buildWsSignedParams(params) {
     .map((k) => `${k}=${params[k]}`)
     .join("&");
 
-  const signature = generateSignature(sortedPayload);
+  const signature = crypto
+    .sign(null, Buffer.from(sortedPayload), privateKey)
+    .toString("base64");
+
   return { params: { ...params, signature } };
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+// ============================================================
+// FIRMA HMAC-SHA256 — para REST API (polling fallback)
+// ============================================================
 
+/**
+ * Construye query string con percent-encoding correcto para Binance REST.
+ * Cada clave y valor se encodea individualmente antes de firmar.
+ */
+function buildSignedQuery(params) {
+  const queryString = Object.entries(params)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join("&");
+
+  const signature = crypto
+    .createHmac("sha256", BINANCE_API_SECRET)
+    .update(queryString)
+    .digest("hex");
+
+  return { queryString, signature };
+}
+
+// ============================================================
+// FETCH CON TIMEOUT
+// ============================================================
+
+async function fetchWithTimeout(url, options = {}, ms = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
   try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
-    return response;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === "AbortError") {
-      throw new Error(`Timeout después de ${timeoutMs}ms`);
-    }
-    throw error;
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timer);
+    return res;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") throw new Error(`Timeout (${ms}ms)`);
+    throw err;
   }
 }
 
-// ========================================
-// WEBSOCKET — NUEVO SISTEMA (V6)
-// Autenticación directa sin listenKey
-// ========================================
+// ============================================================
+// WEBSOCKET — AUTENTICACIÓN Ed25519
+// ============================================================
 
 function connectWebSocket() {
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
@@ -150,9 +173,9 @@ function connectWebSocket() {
     perMessageDeflate: false,
   });
 
-  // ── OPEN: autenticar sesión ──────────────────────────────────────────────
+  // ── OPEN: autenticar con Ed25519 ─────────────────────────────────────────
   ws.on("open", () => {
-    console.log("✅ WebSocket conectado — autenticando sesión...");
+    console.log("✅ WebSocket conectado — autenticando con Ed25519...");
 
     const timestamp = Date.now();
     const { params } = buildWsSignedParams({
@@ -177,7 +200,7 @@ function connectWebSocket() {
     }, PING_INTERVAL_MS);
   });
 
-  // ── MESSAGE: manejar respuestas y eventos ────────────────────────────────
+  // ── MESSAGE ───────────────────────────────────────────────────────────────
   ws.on("message", async (data) => {
     let msg;
     try {
@@ -189,18 +212,18 @@ function connectWebSocket() {
       );
       return;
     }
-    console.log("Mensaje: ", msg);
+
     // Respuesta al session.logon
     if (msg.id === "session-login") {
       if (msg.status === 200) {
-        console.log("✅ Sesión autenticada correctamente");
+        console.log("✅ Sesión autenticada con Ed25519");
         isAuthenticated = true;
-        reconnectAttempts = 0; // reset solo tras auth exitosa
+        reconnectAttempts = 0;
         subscribeUserDataStream();
       } else {
         console.error("❌ Error en autenticación:", JSON.stringify(msg.error));
-        // Error de autenticación — no tiene sentido reintentar con backoff
-        // ya que el problema es la API key, no la conexión
+        console.error("   Código:", msg.error?.code);
+        console.error("   Mensaje:", msg.error?.msg);
         ws.close(1008, "Auth failed");
       }
       return;
@@ -212,40 +235,37 @@ function connectWebSocket() {
         console.log("✅ Suscrito al User Data Stream");
         console.log("   Escuchando eventos de órdenes...\n");
         isSubscribed = true;
+        deactivateFallbackPolling();
       } else {
-        console.error(
-          "❌ Error suscribiendo al User Data Stream:",
-          JSON.stringify(msg.error),
-        );
+        console.error("❌ Error suscribiendo:", JSON.stringify(msg.error));
       }
       return;
     }
 
-    // Respuesta a session.status (health check)
+    // Respuesta a session.status
     if (msg.id === "session-status") {
       console.log("📊 Estado de sesión:", msg.result?.status || "desconocido");
       return;
     }
 
-    // Eventos de usuario — executionReport, balanceUpdate, outboundAccountPosition
+    // Eventos de usuario
     if (msg.e) {
       await handleUserDataEvent(msg);
       return;
     }
 
-    // Mensajes no reconocidos
     console.log(
       "📨 Mensaje sin handler:",
       JSON.stringify(msg).substring(0, 150),
     );
   });
 
-  // ── ERROR ────────────────────────────────────────────────────────────────
+  // ── ERROR ─────────────────────────────────────────────────────────────────
   ws.on("error", (error) => {
     console.error("❌ Error WebSocket:", error.message);
   });
 
-  // ── CLOSE: reconexión con backoff exponencial ────────────────────────────
+  // ── CLOSE ─────────────────────────────────────────────────────────────────
   ws.on("close", (code, reason) => {
     const reasonStr = reason?.toString() || "sin motivo";
     console.log(
@@ -255,11 +275,19 @@ function connectWebSocket() {
     isAuthenticated = false;
     isSubscribed = false;
 
-    // Código 1008 = error de autenticación — no reconectar automáticamente
     if (code === 1008) {
-      console.error("❌ Error de autenticación. Verifica tus API keys.");
+      console.error("\n❌ Error de autenticación. Posibles causas:");
       console.error(
-        "   Proceso detenido. Corrige las credenciales y reinicia.",
+        "   • BINANCE_API_KEY no corresponde a la llave Ed25519 registrada",
+      );
+      console.error(
+        "   • BINANCE_PRIVATE_KEY tiene formato incorrecto (revisar \\n)",
+      );
+      console.error(
+        "   • La API key fue eliminada o desactivada en Binance Testnet",
+      );
+      console.error(
+        "\n   Corrige las variables de entorno y reinicia el servicio.",
       );
       process.exit(1);
     }
@@ -269,15 +297,14 @@ function connectWebSocket() {
     setTimeout(connectWebSocket, delay);
   });
 
-  // ── PONG del servidor ────────────────────────────────────────────────────
   ws.on("pong", () => {
-    console.log("🏓 Pong recibido del servidor");
+    console.log("🏓 Pong recibido");
   });
 }
 
-// ========================================
+// ============================================================
 // SUSCRIPCIÓN AL USER DATA STREAM
-// ========================================
+// ============================================================
 
 function subscribeUserDataStream() {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -295,9 +322,9 @@ function subscribeUserDataStream() {
   );
 }
 
-// ========================================
+// ============================================================
 // MANEJO DE EVENTOS DE USUARIO
-// ========================================
+// ============================================================
 
 async function handleUserDataEvent(event) {
   switch (event.e) {
@@ -311,12 +338,10 @@ async function handleUserDataEvent(event) {
 
     case "balanceUpdate":
       console.log(`\n💰 balanceUpdate — Asset: ${event.a}, Delta: ${event.d}`);
-      // No se envía al webhook de órdenes, solo se loguea
       break;
 
     case "outboundAccountPosition":
       console.log(`\n📋 outboundAccountPosition — Balances actualizados`);
-      // No se envía al webhook de órdenes, solo se loguea
       break;
 
     default:
@@ -329,35 +354,35 @@ async function trackAndForwardOrder(event) {
   const currentStatus = event.X;
   const previousStatus = lastKnownOrders.get(orderId);
 
-  // Evitar duplicados si el estado no cambió
   if (previousStatus === currentStatus) {
-    console.log(`   (Sin cambio de estado, ignorando)`);
+    console.log("   (Sin cambio de estado, ignorando)");
     return;
   }
 
   console.log(`   Estado: ${previousStatus || "NUEVO"} → ${currentStatus}`);
   lastKnownOrders.set(orderId, currentStatus);
 
-  // Con WebSocket real recibimos TODOS los estados, no solo FILLED/CANCELED.
-  // Enviamos el evento tal cual al webhook para que SLAY decida qué hacer.
   await sendToWebhook(event);
 
-  // Limpiar tracking de órdenes antiguas (>200 entries)
+  // Limpiar tracking cuando supera 200 entradas
   if (lastKnownOrders.size > 200) {
     const oldest = [...lastKnownOrders.keys()].slice(0, 100);
     oldest.forEach((k) => lastKnownOrders.delete(k));
-    console.log("🧹 Limpieza de tracking completada");
+    console.log("🧹 Tracking limpiado");
   }
 }
 
-// ========================================
-// POLLING COMO FALLBACK
-// Solo se activa si el WebSocket falla completamente
-// ========================================
-
-let pollingInterval = null;
+// ============================================================
+// POLLING FALLBACK — solo si WebSocket falla
+// Usa HMAC porque los endpoints REST siguen aceptándolo
+// ============================================================
 
 async function checkOrdersViaPolling() {
+  if (!BINANCE_API_SECRET) {
+    console.warn("⚠️  BINANCE_API_SECRET no definida — polling desactivado");
+    return [];
+  }
+
   try {
     const timestamp = Date.now();
     const { queryString, signature } = buildSignedQuery({
@@ -380,7 +405,7 @@ async function checkOrdersViaPolling() {
 
     const openOrders = await response.json();
 
-    // También traer órdenes recientes para detectar FILLED
+    // Órdenes recientes para detectar FILLED
     const ts2 = Date.now();
     const { queryString: qs2, signature: sig2 } = buildSignedQuery({
       symbol: "BTCUSDT",
@@ -388,13 +413,13 @@ async function checkOrdersViaPolling() {
       timestamp: ts2,
     });
 
-    const allOrdersResponse = await fetchWithTimeout(
+    const allOrdersRes = await fetchWithTimeout(
       `${CURRENT_CONFIG.REST_URL}/api/v3/allOrders?${qs2}&signature=${sig2}`,
       { headers: { "X-MBX-APIKEY": BINANCE_API_KEY } },
       10000,
     );
 
-    const allOrders = await allOrdersResponse.json();
+    const allOrders = await allOrdersRes.json();
     await processPollingOrders(allOrders);
 
     return openOrders;
@@ -464,7 +489,6 @@ function convertRestOrderToWsEvent(order) {
 function activateFallbackPolling() {
   if (pollingInterval) return;
   console.log("\n⚠️  Activando polling de emergencia (fallback)...");
-  console.log("   Intervalo: 15 segundos");
   checkOrdersViaPolling();
   pollingInterval = setInterval(checkOrdersViaPolling, 15000);
 }
@@ -476,16 +500,15 @@ function deactivateFallbackPolling() {
   console.log("✅ Polling de emergencia desactivado — WebSocket activo");
 }
 
-// ========================================
+// ============================================================
 // ENVIAR AL WEBHOOK
-// ========================================
+// ============================================================
 
 async function sendToWebhook(event) {
   const {
     i: orderId,
     s: symbol,
     X: status,
-    x: eventType,
     z: executedQty,
     S: side,
     p: price,
@@ -509,7 +532,7 @@ async function sendToWebhook(event) {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "User-Agent": "Binance-Listener/6.0",
+            "User-Agent": "Binance-Listener/7.0",
             "X-Binance-Event": "executionReport",
             "X-Event-Source": event._source || "websocket",
           },
@@ -519,16 +542,13 @@ async function sendToWebhook(event) {
       );
 
       if (response.ok) {
-        console.log(`✅ Webhook enviado exitosamente`);
+        console.log("✅ Webhook enviado exitosamente");
         return true;
-      } else {
-        console.error(`❌ Webhook respondió: ${response.status}`);
       }
+      console.error(`❌ Webhook respondió: ${response.status}`);
     } catch (error) {
       console.error(`❌ Intento ${attempt}/3 falló:`, error.message);
-      if (attempt < 3) {
-        await new Promise((r) => setTimeout(r, 2000 * attempt));
-      }
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 2000 * attempt));
     }
   }
 
@@ -536,9 +556,9 @@ async function sendToWebhook(event) {
   return false;
 }
 
-// ========================================
+// ============================================================
 // HEALTH SERVER
-// ========================================
+// ============================================================
 
 function startHealthServer() {
   const PORT = process.env.PORT || 3000;
@@ -556,7 +576,7 @@ function startHealthServer() {
       res.end(
         JSON.stringify({
           status: isHealthy ? "healthy" : "unhealthy",
-          mode: "websocket",
+          mode: "websocket-ed25519",
           environment: IS_TESTNET ? "testnet" : "mainnet",
           ws_status: wsStatus,
           authenticated: isAuthenticated,
@@ -572,7 +592,8 @@ function startHealthServer() {
         JSON.stringify(
           {
             service: "binance-listener",
-            version: "6.0",
+            version: "7.0",
+            auth_method: "Ed25519",
             mode: "websocket-api-authenticated",
             environment: IS_TESTNET ? "testnet" : "mainnet",
             ws_api_url: CURRENT_CONFIG.WS_API_URL,
@@ -600,7 +621,6 @@ function startHealthServer() {
         );
       });
     } else if (req.url === "/ws-status") {
-      // Solicitar estado de sesión al WebSocket
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(
           JSON.stringify({ id: "session-status", method: "session.status" }),
@@ -630,9 +650,9 @@ function startHealthServer() {
   return server;
 }
 
-// ========================================
+// ============================================================
 // GRACEFUL SHUTDOWN
-// ========================================
+// ============================================================
 
 function setupGracefulShutdown(server) {
   async function shutdown(signal) {
@@ -642,7 +662,6 @@ function setupGracefulShutdown(server) {
     clearInterval(pollingInterval);
 
     if (ws && ws.readyState === WebSocket.OPEN) {
-      // Logout de la sesión antes de cerrar
       ws.send(
         JSON.stringify({ id: "session-logout", method: "session.logout" }),
       );
@@ -651,7 +670,6 @@ function setupGracefulShutdown(server) {
     }
 
     server.close(() => console.log("✅ HTTP server cerrado"));
-
     setTimeout(() => {
       console.log("✅ Shutdown completo");
       process.exit(0);
@@ -662,75 +680,86 @@ function setupGracefulShutdown(server) {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
-// ========================================
+// ============================================================
 // INICIALIZACIÓN
-// ========================================
+// ============================================================
 
 async function initialize() {
   console.log("\n");
   console.log("═══════════════════════════════════════════════════════");
-  console.log("🚀 Binance Listener V6 — WebSocket API Autenticado");
+  console.log("🚀 Binance Listener V7 — Ed25519 WebSocket API");
   console.log("═══════════════════════════════════════════════════════");
   console.log("Ambiente:", IS_TESTNET ? "TESTNET 🧪" : "MAINNET 🚀");
-  console.log("Modo:    WebSocket API (sin listenKey)");
-  console.log("WS URL: ", CURRENT_CONFIG.WS_API_URL);
-  console.log("Webhook:", WEBHOOK_URL || "⚠️ NO CONFIGURADO");
+  console.log("Auth:     Ed25519 (WebSocket) + HMAC (REST fallback)");
+  console.log("WS URL:  ", CURRENT_CONFIG.WS_API_URL);
+  console.log("Webhook:", WEBHOOK_URL || "⚠️  NO CONFIGURADO");
   console.log("═══════════════════════════════════════════════════════\n");
 
+  // Validaciones de entorno
   if (!WEBHOOK_URL) {
-    console.error("❌ WEBHOOK_URL no configurado en .env");
+    console.error("❌ WEBHOOK_URL no configurada");
     process.exit(1);
   }
 
-  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
-    console.error("❌ BINANCE_API_KEY o BINANCE_API_SECRET no configurados");
+  if (!BINANCE_API_KEY) {
+    console.error("❌ BINANCE_API_KEY no configurada");
     process.exit(1);
   }
 
-  // Verificar conectividad básica antes de abrir WebSocket
+  // Cargar llave privada Ed25519
+  try {
+    console.log("🔑 Cargando llave privada Ed25519...");
+    privateKey = loadPrivateKey();
+    console.log("✅ Llave privada Ed25519 cargada correctamente\n");
+  } catch (err) {
+    console.error("❌", err.message);
+    console.error(
+      "\n   Verifica que BINANCE_PRIVATE_KEY en Render contiene el PEM completo",
+    );
+    console.error("   con \\n entre cada línea (formato de una sola línea).");
+    process.exit(1);
+  }
+
+  // Verificar conectividad REST
   try {
     console.log("🔍 Verificando conectividad con Binance...");
-    const pingResponse = await fetchWithTimeout(
+    const pingRes = await fetchWithTimeout(
       `${CURRENT_CONFIG.REST_URL}/api/v3/ping`,
       {},
       5000,
     );
-    if (pingResponse.ok) {
+    if (pingRes.ok) {
       console.log("✅ Binance REST API accesible\n");
     } else {
       console.warn(
-        `⚠️  Binance REST respondió ${pingResponse.status} — continuando de todas formas`,
+        `⚠️  Binance REST respondió ${pingRes.status} — continuando de todas formas\n`,
       );
     }
-  } catch (error) {
-    console.warn(`⚠️  No se pudo hacer ping a Binance: ${error.message}`);
-    console.warn("   Puede ser geoblocking. Continuando con WebSocket...\n");
+  } catch (err) {
+    console.warn(`⚠️  Ping fallido: ${err.message} — puede ser geoblocking\n`);
   }
 
   const server = startHealthServer();
   setupGracefulShutdown(server);
 
-  // Conectar WebSocket principal
+  // Conectar WebSocket
   connectWebSocket();
 
-  // Activar polling de emergencia si el WebSocket no se suscribe en 30 segundos
+  // Activar polling de emergencia si el WebSocket no se suscribe en 30s
   const fallbackTimer = setTimeout(() => {
     if (!isSubscribed) {
       console.warn(
-        "\n⚠️  WebSocket no logró suscribirse en 30s — activando polling de emergencia",
+        "\n⚠️  WebSocket no suscrito en 30s — activando polling de emergencia",
       );
       activateFallbackPolling();
     }
   }, 30000);
 
-  // Desactivar polling si el WebSocket se conecta exitosamente
+  // Desactivar polling cuando WebSocket se recupere
   const checkSubscription = setInterval(() => {
-    if (isSubscribed && pollingInterval) {
-      deactivateFallbackPolling();
-    }
+    if (isSubscribed && pollingInterval) deactivateFallbackPolling();
   }, 5000);
 
-  // Cleanup de timers internos (no de negocio)
   process.on("exit", () => {
     clearTimeout(fallbackTimer);
     clearInterval(checkSubscription);
@@ -739,9 +768,9 @@ async function initialize() {
   console.log("✅ Inicialización completada\n");
 }
 
-// ========================================
+// ============================================================
 // ERROR HANDLING GLOBAL
-// ========================================
+// ============================================================
 
 process.on("uncaughtException", (error) => {
   console.error("❌ UNCAUGHT EXCEPTION:", error.message);
@@ -752,11 +781,11 @@ process.on("unhandledRejection", (reason) => {
   console.error("❌ UNHANDLED REJECTION:", reason);
 });
 
-// ========================================
+// ============================================================
 // START
-// ========================================
+// ============================================================
 
 initialize().catch((error) => {
-  console.error("❌ Error fatal en inicialización:", error);
+  console.error("❌ Error fatal:", error.message);
   process.exit(1);
 });
